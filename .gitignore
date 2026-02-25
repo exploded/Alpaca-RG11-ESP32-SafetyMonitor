@@ -1,0 +1,5 @@
+.pio
+.vscode/
+
+# WiFi credentials – never commit
+include/secrets.h
