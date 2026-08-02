@@ -1,5 +1,8 @@
 .pio
 .vscode/
 
+# Local scratch – working photos, notes; never commit
+.local/
+
 # WiFi credentials – never commit
 include/secrets.h

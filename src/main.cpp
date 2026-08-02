@@ -1,61 +1,102 @@
 /*
- * Alpaca RG-11 Safety Monitor – ESP32-C3 SuperMini (Arduino framework)
+ * Alpaca RG-11 Safety Monitor (Arduino framework)
  *
- * Hardware:
- *   Board  : ESP32-C3 SuperMini (HW-466AB)
- *   Sensor : Hydreon RG-11 rain sensor relay output → GPIO 20
- *   Display: 0.91" SSD1306 OLED (I2C) → SCL=GPIO 4, SDA=GPIO 3
+ * Board  : ESP32-WROOM-32 DevKit (30-pin) on a screw-terminal expansion board
+ * Sensor : Hydreon RG-11 rain sensor relay  COM -> GPIO 27, NO -> GND
+ *          plus a 4.7k pull-up from GPIO 27 to 3V3 (see README — the external
+ *          pull-up is required, it supplies the relay's contact wetting current)
+ * Display: GC9A01 1.28" round TFT, 240x240, seated directly on the first seven
+ *          header pins: VCC GND SCL SDA DC CS RST -> 3V3 GND D15 D2 D4 D16 D17.
+ *          Pin numbers live in platformio.ini as TFT_eSPI build flags.
+ *
+ * The device is unattended overnight, so it supervises itself: a task watchdog
+ * catches hung handlers, a WiFi supervisor escalates from re-associate to
+ * reboot, and a diagnostics record in RTC memory survives those reboots so the
+ * cause is still visible afterwards at http://<ip>/.
  *
  * WiFi credentials live in include/secrets.h (git-ignored).
- * Copy include/secrets.h.example → include/secrets.h and fill in your values.
+ * Copy include/secrets.h.example -> include/secrets.h and fill in your values.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <AsyncUDP.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <TFT_eSPI.h>
+#include <esp_task_wdt.h>
+#include <time.h>
 #include "secrets.h"
 
-// ── Pin / display constants ───────────────────────────────────────────────────
+// ── Pins ──────────────────────────────────────────────────────────────────────
+// GPIO 27 has no strapping or boot function and supports the internal pull-up.
+// Do NOT move this to 34/35/36/39 — those are input-only with no pull-up, so
+// INPUT_PULLUP compiles and silently does nothing.
+#define RAIN_PIN        27
 
-#define RAIN_PIN        20   // GPIO 20 – RG-11 relay COM (active-LOW when raining)
+// ── Ports ─────────────────────────────────────────────────────────────────────
+#define INFO_PORT          80
+#define ALPACA_PORT     11111
+#define DISC_PORT       32227
 
-#define OLED_SCL         4   // GPIO 4 – I2C SCL
-#define OLED_SDA         3   // GPIO 3 – I2C SDA
-#define OLED_WIDTH     128
-#define OLED_HEIGHT     32
-// OLED_ADDR is detected at runtime (0x3C or 0x3D) – see setup()
-static uint8_t  g_oledAddr = 0x3C;   // default; overwritten by I2C scan
+// ── Debounce ──────────────────────────────────────────────────────────────────
+#define DEB_SAMPLES        5   // majority-vote window
+#define DEB_INTERVAL_MS  100   // sample every 100 ms -> 500 ms settling time
 
-// ── Alpaca protocol constants ─────────────────────────────────────────────────
+// ── Watchdogs ─────────────────────────────────────────────────────────────────
+// 1. Hardware task watchdog — reboots if loop() stops running (hung handler,
+//    deadlock, wedged network stack). Fed once per loop() iteration.
+// 2. WiFi supervisor — polls the link, re-associates, and finally reboots if
+//    the association can't be recovered.
+// 3. Heap floor — the HTTP handlers build responses with String concatenation;
+//    if that ever leaks, reboot before the allocator starts failing.
+#define WDT_TIMEOUT_S             30
+#define WIFI_CHECK_INTERVAL_MS    5000UL   // how often to poll link state
+#define WIFI_RECONNECT_WAIT_MS   15000UL   // grace period per reconnect attempt
+#define WIFI_MAX_RECONNECT_TRIES  4        // ~60 s down, then reboot
+#define BOOT_WIFI_REBEGIN_TRIES   30       // 30 x 500 ms = 15 s, then re-begin
+#define BOOT_WIFI_MAX_TRIES       60       // 60 x 500 ms = 30 s, then reboot
+#define HEAP_FLOOR_BYTES      40000UL      // reboot below this much free heap
 
-#define ALPACA_PORT    11111
-#define DISC_PORT      32227
+// ── Time (house convention: Melbourne, DST handled by configTzTime) ───────────
+static const char *TZ_INFO      = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+static const char *NTP_SERVER_1 = "pool.ntp.org";
+static const char *NTP_SERVER_2 = "time.nist.gov";
+#define TIME_SYNCED_EPOCH  1704067200UL   // 2024-01-01; anything below = not synced
 
-// ── Debounce settings ─────────────────────────────────────────────────────────
+// ── Display geometry / palette ────────────────────────────────────────────────
+#define SCR_W      240
+#define SCR_H      240
+#define CX         120
+#define CY         120
+#define R_OUTER    120
+#define R_INNER     98   // leaves a 22 px coloured annulus
 
-#define DEB_SAMPLES       5   // majority-vote window
-#define DEB_INTERVAL_MS 100   // sample every 100 ms  → 500 ms settling time
+static constexpr uint16_t COL_BG   = TFT_BLACK;
+static constexpr uint16_t COL_TEXT = 0xDEFB;  // near-white
+static constexpr uint16_t COL_DIM  = 0x7BEF;  // grey
+static constexpr uint16_t COL_GOOD = 0x2661;  // green
+static constexpr uint16_t COL_BAD  = 0xE124;  // red
 
 // ── Global objects ────────────────────────────────────────────────────────────
+WebServer   webServer(INFO_PORT);     // human-readable status page
+WebServer   httpServer(ALPACA_PORT);  // ASCOM Alpaca API
+AsyncUDP    asyncUdp;
 
-WebServer            webServer(80);            // Human-readable status page
-WebServer            httpServer(ALPACA_PORT);  // ASCOM Alpaca API
-AsyncUDP             asyncUdp;
-Adafruit_SSD1306     oled(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+TFT_eSPI    tft;
+TFT_eSprite spr(&tft);
+static bool g_spriteOk = false;
+// Drawing goes through this so the layout code is identical whether we render
+// into the off-screen sprite or straight to the panel.
+static TFT_eSPI *gfx = &tft;
 
 // ── Sensor / Alpaca state (single loop – no concurrent tasks – no mutex) ──────
-
-static bool     g_oledOk     = false;  // set after oled.begin() succeeds
 static int      g_rawLevel   = 1;
 static int      g_debounced  = 1;
 static uint32_t g_lastChange = 0;
 static uint32_t g_totalTrans = 0;
 static bool     g_alpacaConn = false;
 static uint32_t g_serverTxId = 1;
+static String   g_uniqueId;          // MAC-derived, built in setup()
 
 // Debounce ring buffer
 static int  g_samples[DEB_SAMPLES];
@@ -63,24 +104,373 @@ static int  g_sampleIdx = 0;
 
 // Loop timers
 static uint32_t g_nextDebounce  = 0;
-static uint32_t g_nextOled      = 0;
+static uint32_t g_nextDisplay   = 0;
 static uint32_t g_nextHeartbeat = 0;
-static uint32_t g_nextWifiRetry = 0;
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+// Lives in RTC memory, which survives a software reset and a watchdog reset but
+// not a power cycle. That's exactly what we want: if the device reboots itself
+// overnight, the reason is still on the status page in the morning.
+//
+// Bump the magic whenever the layout below changes, otherwise a reflash can find
+// stale RTC contents that still match the old magic and decode as garbage.
+#define DIAG_MAGIC   0x52473131UL   // "RG11" — rev 1
+#define DIAG_EVENTS  12
+
+enum DiagEvent : uint8_t {
+    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_RAIN, EV_DRY
+};
+
+struct DiagEntry {
+    uint32_t epoch;      // 0 if the clock wasn't synced yet
+    uint32_t uptimeSec;
+    uint8_t  type;
+    uint8_t  detail;     // EV_WIFI_LOST: the 802.11 disconnect reason code
+};
+
+struct DiagRecord {
+    uint32_t  magic;
+    uint32_t  bootCount;
+    uint32_t  wifiDrops;   // cumulative across reboots, unlike s_wifiDropCount
+    uint8_t   head;
+    DiagEntry ev[DIAG_EVENTS];
+};
+
+RTC_NOINIT_ATTR DiagRecord s_diag;
+
+static const char *diagEventName(uint8_t t)
+{
+    switch (t) {
+        case EV_BOOT:      return "boot";
+        case EV_WIFI_LOST: return "WiFi lost";
+        case EV_WIFI_OK:   return "WiFi recovered";
+        case EV_REBOOT:    return "self-reboot";
+        case EV_RAIN:      return "RAIN — unsafe";
+        case EV_DRY:       return "dry — safe";
+        default:           return "";
+    }
+}
+
+static const char *resetReasonName()
+{
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "power-on";
+        case ESP_RST_SW:        return "software restart";
+        case ESP_RST_PANIC:     return "panic / exception";
+        case ESP_RST_TASK_WDT:  return "TASK WATCHDOG";
+        case ESP_RST_INT_WDT:   return "interrupt watchdog";
+        case ESP_RST_WDT:       return "other watchdog";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT (power dip)";
+        case ESP_RST_EXT:       return "external reset pin";
+        case ESP_RST_DEEPSLEEP: return "deep sleep wake";
+        default:                return "unknown";
+    }
+}
+
+static void diagLog(DiagEvent type, uint8_t detail = 0)
+{
+    DiagEntry &e = s_diag.ev[s_diag.head];
+    time_t now   = time(nullptr);
+    e.epoch      = (now > (time_t)TIME_SYNCED_EPOCH) ? (uint32_t)now : 0;
+    e.uptimeSec  = millis() / 1000UL;
+    e.type       = (uint8_t)type;
+    e.detail     = detail;
+    s_diag.head  = (s_diag.head + 1) % DIAG_EVENTS;
+}
+
+// The common 802.11 reason codes, so the log reads without a lookup table.
+// 15 in particular means the AP's group-key rotation timed out — a classic
+// cause of a single unexplained nightly drop.
+static const char *wifiReasonName(uint8_t r)
+{
+    switch (r) {
+        case 1:   return "unspecified";
+        case 2:   return "auth expired";
+        case 4:   return "assoc expired (AP idle timeout)";
+        case 8:   return "AP deauthenticated us";
+        case 15:  return "4-way handshake timeout (group rekey)";
+        case 200: return "beacon timeout (AP unreachable)";
+        case 201: return "no AP found";
+        case 202: return "auth failed";
+        case 203: return "assoc failed";
+        default:  return "";
+    }
+}
+
+// Local wall-clock string, or an uptime fallback when NTP hadn't synced yet.
+static String diagWhen(const DiagEntry &e)
+{
+    if (e.epoch == 0) return "+" + String(e.uptimeSec) + "s (no clock)";
+    time_t t = (time_t)e.epoch;
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[24];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+    return String(buf);
+}
+
+// Diagnostics card for the status page — newest event first.
+static String diagCardHtml()
+{
+    String h = "<div class='card'><h2>Diagnostics</h2>"
+               "<p><strong>Last reset:</strong> " + String(resetReasonName()) + "</p>"
+               "<p><strong>Boots since power-on:</strong> " + String(s_diag.bootCount) + "</p>"
+               "<p><strong>WiFi drops since power-on:</strong> " + String(s_diag.wifiDrops) + "</p>";
+
+    time_t now = time(nullptr);
+    h += "<p><strong>Clock:</strong> ";
+    if (now > (time_t)TIME_SYNCED_EPOCH) {
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+        h += buf;
+    } else {
+        h += "not synced";
+    }
+    h += "</p>";
+
+    h += "<table><tr><th align='left'>When</th><th align='left'>Event</th></tr>";
+    bool any = false;
+    for (int i = 0; i < DIAG_EVENTS; i++) {
+        // walk backwards from the most recently written slot
+        int idx = (s_diag.head - 1 - i + 2 * DIAG_EVENTS) % DIAG_EVENTS;
+        const DiagEntry &e = s_diag.ev[idx];
+        if (e.type == EV_NONE) continue;
+        any = true;
+        String what = diagEventName(e.type);
+        if (e.type == EV_WIFI_LOST) {
+            what += " — reason " + String(e.detail);
+            const char *rn = wifiReasonName(e.detail);
+            if (rn[0]) what += " (" + String(rn) + ")";
+        }
+        h += "<tr><td><code>" + diagWhen(e) + "</code></td><td>" + what + "</td></tr>";
+    }
+    if (!any) h += "<tr><td colspan='2'>no events recorded</td></tr>";
+    h += "</table></div>";
+    return h;
+}
+
+// ── WiFi supervisor state ─────────────────────────────────────────────────────
+static uint32_t s_lastWifiCheckMs = 0;
+static uint32_t s_wifiDownSinceMs = 0;   // 0 = link is up
+static uint8_t  s_wifiRetries     = 0;
+static uint32_t s_wifiDropCount   = 0;   // reported on the status page
+
+// Set from the WiFi event task, consumed in loop(). The handler must stay this
+// trivial: WiFi.begin()/disconnect() must not be called from the event context,
+// so all it does is raise a flag that forces the next poll to run immediately.
+static volatile bool    s_wifiEvtDisconnected  = false;
+static volatile bool    s_wifiEvtGotIp         = false;
+static volatile uint8_t s_wifiDisconnectReason = 0;
+
+static void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            s_wifiDisconnectReason = info.wifi_sta_disconnected.reason;
+            s_wifiEvtDisconnected  = true;
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            s_wifiEvtGotIp = true;
+            break;
+        default:
+            break;
+    }
+}
+
+// ── Display ───────────────────────────────────────────────────────────────────
+//
+//  displayInit()    – bring up the panel, returns true on success
+//  displayMessage() – two-line boot-progress message
+//  displayUpdate()  – periodic status screen (called every 1 s)
+//
+//  240 x 240 round layout:
+//    a 22 px coloured annulus at the rim — green SAFE / red NOT SAFE —
+//    around a black centre carrying the text.  Everything is drawn into an
+//    8-bit off-screen sprite (57.6 kB) and pushed in one go, so there is no
+//    flicker even though the GC9A01 itself has no frame buffer.
+
+static bool displayInit()
+{
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(COL_BG);
+
+    spr.setColorDepth(8);
+    g_spriteOk = (spr.createSprite(SCR_W, SCR_H) != nullptr);
+    gfx = g_spriteOk ? (TFT_eSPI *)&spr : &tft;
+
+    Serial.printf("GC9A01 initialised (240x240), sprite %s\n",
+                  g_spriteOk ? "OK" : "FAILED - drawing direct");
+    return true;
+}
+
+static void displayPush()
+{
+    if (g_spriteOk) spr.pushSprite(0, 0);
+}
+
+static void displayMessage(const char *l1, const String &l2)
+{
+    gfx->fillScreen(COL_BG);
+    gfx->setTextDatum(MC_DATUM);
+    gfx->setTextColor(COL_TEXT, COL_BG);
+    gfx->setTextFont(4);
+    gfx->drawString(l1, CX, CY - 16);
+    gfx->setTextFont(2);
+    gfx->drawString(l2, CX, CY + 16);
+    displayPush();
+}
+
+static void displayUpdate()
+{
+    const bool     safe = (g_debounced == 1);
+    const uint16_t ring = safe ? COL_GOOD : COL_BAD;
+    const bool     up   = (WiFi.status() == WL_CONNECTED);
+
+    gfx->fillScreen(COL_BG);
+    gfx->fillCircle(CX, CY, R_OUTER, ring);
+    gfx->fillCircle(CX, CY, R_INNER, COL_BG);
+
+    gfx->setTextDatum(MC_DATUM);
+
+    // Headline — FreeSans is the largest built-in face with a full alphabet
+    // (fonts 6/7/8 are digits-only, so they can't render "SAFE").
+    gfx->setTextColor(safe ? COL_GOOD : COL_BAD, COL_BG);
+    gfx->setFreeFont(&FreeSansBold18pt7b);
+    gfx->drawString(safe ? "SAFE" : "NOT SAFE", CX, 95);
+    gfx->setTextFont(2);   // back to the built-in fonts
+
+    gfx->setTextColor(COL_TEXT, COL_BG);
+    gfx->drawString(up ? WiFi.localIP().toString() : String("No WiFi"), CX, 142);
+
+    gfx->setTextColor(COL_DIM, COL_BG);
+    gfx->drawString(String(g_alpacaConn ? "Alpaca:OK" : "Alpaca:--") +
+                    "  T:" + String(g_totalTrans), CX, 168);
+
+    gfx->setTextFont(1);
+    char foot[32];
+    snprintf(foot, sizeof(foot), "%ddBm  up %lum",
+             up ? WiFi.RSSI() : 0, (unsigned long)(millis() / 60000UL));
+    gfx->drawString(foot, CX, 192);
+
+    displayPush();
+}
+
+// ── Restart helper ────────────────────────────────────────────────────────────
+// A reboot is only ever triggered when the device is already unreachable (WiFi
+// down) or already broken (heap exhausted), so unlike the roof controller there
+// is nothing to defer to — no client can observe the gap either way.
+static void safeRestart(const char *reason)
+{
+    Serial.printf("Restarting: %s\n", reason);
+    diagLog(EV_REBOOT);
+    displayMessage("Restarting", reason);
+    Serial.flush();
+    delay(1000);
+    ESP.restart();
+}
+
+// ── Alpaca UDP discovery ──────────────────────────────────────────────────────
+// AsyncUDP handles receive + reply on the same socket. WiFiUDP cannot: sending
+// on the socket it is listening on returns ENOMEM. Re-armed after a WiFi
+// recovery because the bound socket does not reliably survive re-association.
+static void startDiscovery()
+{
+    asyncUdp.close();
+    if (!asyncUdp.listen(DISC_PORT)) {
+        Serial.println("AsyncUDP listen FAILED");
+        return;
+    }
+    asyncUdp.onPacket([](AsyncUDPPacket packet) {
+        if (packet.length() < 16) return;
+        if (strncmp((char *)packet.data(), "alpacadiscovery1", 16) != 0) return;
+        // The discovery reply MUST contain only AlpacaPort. Adding a "Devices"
+        // array here made N.I.N.A silently drop the device — clients fetch the
+        // device list from /management/v1/configureddevices over HTTP once they
+        // know the port.
+        packet.print("{\"AlpacaPort\":" + String(ALPACA_PORT) + "}");
+    });
+    Serial.printf("Alpaca discovery on UDP port %d\n", DISC_PORT);
+}
+
+// ── WiFi supervisor ───────────────────────────────────────────────────────────
+// Polled from loop(). Escalates: notice the drop -> re-associate -> reboot.
+static void maintainWifi()
+{
+    // The driver knows about a drop long before a 5 s poll would notice. Rather
+    // than duplicate the recovery logic, just force the poll below to run now —
+    // shrinking a ~10 s outage to ~2 s, which may be short enough that clients
+    // like N.I.N.A never see a failed request.
+    if (s_wifiEvtDisconnected || s_wifiEvtGotIp) {
+        s_wifiEvtDisconnected = false;
+        s_wifiEvtGotIp        = false;
+        s_lastWifiCheckMs     = 0;   // millis() - 0 always exceeds the interval
+    }
+
+    if (millis() - s_lastWifiCheckMs < WIFI_CHECK_INTERVAL_MS) return;
+    s_lastWifiCheckMs = millis();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (s_wifiDownSinceMs != 0) {
+            Serial.print("WiFi recovered, IP: ");
+            Serial.println(WiFi.localIP());
+            diagLog(EV_WIFI_OK);
+            startDiscovery();   // rebind the discovery socket
+        }
+        s_wifiDownSinceMs = 0;
+        s_wifiRetries     = 0;
+        return;
+    }
+
+    // First time we've seen the link down — kick off a reconnect immediately.
+    if (s_wifiDownSinceMs == 0) {
+        s_wifiDownSinceMs = millis();
+        s_wifiRetries     = 0;
+        s_wifiDropCount++;
+        s_diag.wifiDrops++;
+        uint8_t reason = s_wifiDisconnectReason;
+        Serial.printf("WiFi link lost (reason %u %s) — reconnecting\n",
+                      reason, wifiReasonName(reason));
+        diagLog(EV_WIFI_LOST, reason);
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        return;
+    }
+
+    // Give the current attempt its full grace period before doing anything else.
+    if (millis() - s_wifiDownSinceMs < WIFI_RECONNECT_WAIT_MS) return;
+
+    if (s_wifiRetries >= WIFI_MAX_RECONNECT_TRIES) {
+        safeRestart("WiFi down");
+        return;
+    }
+
+    s_wifiRetries++;
+    Serial.printf("WiFi reconnect attempt %u/%u\n", s_wifiRetries, WIFI_MAX_RECONNECT_TRIES);
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    s_wifiDownSinceMs = millis();
+}
 
 // ── Alpaca response helpers ───────────────────────────────────────────────────
 
-static void addCors() {
+static void addCors()
+{
     httpServer.sendHeader("Access-Control-Allow-Origin",  "*");
     httpServer.sendHeader("Access-Control-Allow-Methods", "GET, PUT, OPTIONS");
     httpServer.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-static uint32_t clientTx() {
+static uint32_t clientTx()
+{
     String s = httpServer.arg("ClientTransactionID");
     return s.length() ? (uint32_t)s.toInt() : 0;
 }
 
-static void sendBool(bool v) {
+static void sendBool(bool v)
+{
     g_alpacaConn = true;
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
@@ -91,7 +481,8 @@ static void sendBool(bool v) {
         (v ? "true" : "false") + "}");
 }
 
-static void sendInt(int v) {
+static void sendInt(int v)
+{
     g_alpacaConn = true;
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
@@ -101,7 +492,8 @@ static void sendInt(int v) {
         ",\"ErrorNumber\":0,\"ErrorMessage\":\"\",\"Value\":" + String(v) + "}");
 }
 
-static void sendStr(const char *v) {
+static void sendStr(const char *v)
+{
     g_alpacaConn = true;
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
@@ -111,40 +503,58 @@ static void sendStr(const char *v) {
         ",\"ErrorNumber\":0,\"ErrorMessage\":\"\",\"Value\":\"" + String(v) + "\"}");
 }
 
-static void sendArr(const char *v) {
+static void sendArr(const String &v)
+{
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
         "{\"ClientTransactionID\":" + String(tx) +
         ",\"ServerTransactionID\":" + String(stx) +
-        ",\"ErrorNumber\":0,\"ErrorMessage\":\"\",\"Value\":" + String(v) + "}");
+        ",\"ErrorNumber\":0,\"ErrorMessage\":\"\",\"Value\":" + v + "}");
 }
 
-// ── HTTP handlers ─────────────────────────────────────────────────────────────
+// ── Status page (port 80) ─────────────────────────────────────────────────────
 
-static void hRoot() {
-    // Alpaca API is on port 11111; build the absolute base URL so the JS
+static void hRoot()
+{
+    // The Alpaca API is on port 11111; build the absolute base URL so the JS
     // fetch works correctly even though this page is served from port 80.
     String apiBase = "http://" + WiFi.localIP().toString() + ":" + String(ALPACA_PORT);
     String html =
         "<html><head><meta charset='UTF-8'>"
-        "<style>body{font-family:sans-serif;margin:20px;background:#f5f5f5}"
-        "h1{color:#333}"
+        "<meta http-equiv='refresh' content='10'>"
+        "<style>body{font-family:Arial,sans-serif;margin:24px;background:#f5f5f5}"
+        "h1{color:#333}h2{margin:0 0 8px;font-size:1.1em;color:#555}"
         ".safe{color:green;font-weight:bold}.unsafe{color:red;font-weight:bold}"
-        ".card{background:white;padding:15px;margin:10px 0;border-radius:5px;"
-        "box-shadow:0 2px 5px rgba(0,0,0,.1)}</style></head>"
-        "<body><h1>RG-11 Safety Monitor</h1><div class='card'>"
-        "<p><b>Status:</b> <span id='s'>--</span></p>"
-        "<p><b>GPIO " + String(RAIN_PIN) + ":</b> <span id='r'>--</span></p>"
-        "<p><b>Transitions:</b> " + String(g_totalTrans) +
-        " | <b>Alpaca:</b> " + (g_alpacaConn ? "Connected" : "Disconnected") +
-        " | <b>IP:</b> " + WiFi.localIP().toString() + "</p></div>"
+        ".card{background:#fff;padding:16px;margin:12px 0;border-radius:8px;"
+        "box-shadow:0 2px 6px rgba(0,0,0,.1)}"
+        "table{border-collapse:collapse;width:100%}"
+        "th,td{padding:4px 8px;border-bottom:1px solid #eee;font-size:.9em}"
+        "</style></head>"
+        "<body><h1>RG-11 Safety Monitor</h1>"
+
+        "<div class='card'><h2>Status</h2>"
+        "<p><strong>Status:</strong> <span id='s'>--</span></p>"
+        "<p><strong>GPIO " + String(RAIN_PIN) + ":</strong> <span id='r'>--</span></p>"
+        "<p><strong>Transitions:</strong> " + String(g_totalTrans) +
+        " | <strong>Alpaca:</strong> " + (g_alpacaConn ? "Connected" : "Disconnected") +
+        " | <strong>IP:</strong> " + WiFi.localIP().toString() + "</p></div>"
+
+        "<div class='card'><h2>Link</h2>"
+        "<p><strong>Uptime:</strong> " + String(millis() / 60000UL) + " min</p>"
+        "<p><strong>WiFi RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>"
+        "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
+        "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
+        "</div>"
+
+        + diagCardHtml() +
+
         "<script>var B='" + apiBase + "';"
         "function u(){"
         "fetch(B+'/api/v1/safetymonitor/0/issafe').then(r=>r.json()).then(d=>{"
         "const s=d.Value===true;"
         "document.getElementById('s').innerHTML=s?"
-        "'<span class=\"safe\">SAFE</span>':'<span class=\"unsafe\">UNSAFE (RAIN)</span>';"
+        "'<span class=\"safe\">SAFE</span>':'<span class=\"unsafe\">NOT SAFE (RAIN)</span>';"
         "document.getElementById('r').innerHTML=s?"
         "'<span style=\"color:green\">HIGH (1)</span>'"
         ":'<span style=\"color:red\">LOW (0)</span>';"
@@ -153,38 +563,46 @@ static void hRoot() {
     webServer.send(200, "text/html", html);
 }
 
+// ── Alpaca handlers ───────────────────────────────────────────────────────────
+
 static void hFavicon()          { webServer.send(404); }
 static void hIsSafe()           { sendBool(g_debounced == 1); }
 static void hConnectedGet()     { sendBool(true); }
 static void hConnectedPut()     { g_alpacaConn = true; sendBool(true); }
 static void hDescription()      { sendStr("Hydreon RG-11 Optical Rain Sensor Safety Monitor"); }
-static void hDriverInfo()       { sendStr("ESP32-C3 SuperMini Alpaca Safety Monitor (Arduino)"); }
-static void hDriverVersion()    { sendStr("2.0.0"); }
-static void hInterfaceVersion() { sendInt(3); }
+static void hDriverInfo()       { sendStr("ESP32 Alpaca Safety Monitor (Arduino)"); }
+static void hDriverVersion()    { sendStr("3.0.0"); }
+// ISafetyMonitorV2 – the classic Connected property, which is what this
+// firmware implements. Claiming 3 (Platform 7) would promise the async
+// Connect/Disconnect/Connecting methods that are not served here.
+static void hInterfaceVersion() { sendInt(2); }
 static void hName()             { sendStr("Alpaca RG-11 Safety Monitor"); }
 static void hSupportedActions() { sendArr("[]"); }
 static void hDeviceState()      { sendArr("[]"); }
 
 static void hMgmtApiVersions()  { sendArr("[1]"); }
 
-static void hMgmtDescription() {
+static void hMgmtDescription()
+{
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
         "{\"ClientTransactionID\":" + String(tx) +
         ",\"ServerTransactionID\":" + String(stx) +
         ",\"ErrorNumber\":0,\"ErrorMessage\":\"\","
-        "\"Value\":{\"ServerName\":\"ESP32-C3 Alpaca\",\"Manufacturer\":\"DIY\","
-        "\"ManufacturerVersion\":\"2.0\",\"Location\":\"Observatory\"}}");
+        "\"Value\":{\"ServerName\":\"RG-11 Safety Monitor\",\"Manufacturer\":\"DIY\","
+        "\"ManufacturerVersion\":\"3.0\",\"Location\":\"Observatory\"}}");
 }
 
-static void hMgmtDevices() {
+static void hMgmtDevices()
+{
     sendArr("[{\"DeviceType\":\"SafetyMonitor\","
             "\"DeviceName\":\"RG-11 Safety Monitor\","
-            "\"DeviceNumber\":0,\"UniqueID\":\"ESP32C3-RG11-SM-0\"}]");
+            "\"DeviceNumber\":0,\"UniqueID\":\"" + g_uniqueId + "\"}]");
 }
 
-static void hNotFound() {
+static void hNotFound()
+{
     if (httpServer.method() == HTTP_OPTIONS) {
         addCors();
         httpServer.send(200);
@@ -193,15 +611,12 @@ static void hNotFound() {
     httpServer.send(404, "text/plain", "Not found");
 }
 
-static void hNotFound80() {
-    webServer.send(404, "text/plain", "Not found");
-}
-
-// ── Alpaca UDP discovery – set up once in setup(), runs via AsyncUDP callback ─
+static void hNotFound80() { webServer.send(404, "text/plain", "Not found"); }
 
 // ── Debounce (called every DEB_INTERVAL_MS) ───────────────────────────────────
 
-static void runDebounce() {
+static void runDebounce()
+{
     int s = digitalRead(RAIN_PIN);
     g_samples[g_sampleIdx] = s;
     g_sampleIdx = (g_sampleIdx + 1) % DEB_SAMPLES;
@@ -215,200 +630,184 @@ static void runDebounce() {
         g_debounced  = newDeb;
         g_lastChange = millis();
         g_totalTrans++;
+        diagLog(g_debounced ? EV_DRY : EV_RAIN);
         Serial.printf("State change → debounced=%d (%s)\n",
                       g_debounced, g_debounced ? "SAFE" : "UNSAFE");
     }
 }
 
-// ── OLED update (called every 1 s) ────────────────────────────────────────────
-//
-//  128 x 32 pixel layout:
-//   y= 0 (16 px, size-2): "SAFE  " / "RAIN! "
-//   y=16 ( 8 px, size-1): IP address
-//   y=24 ( 8 px, size-1): Alpaca status + transition count
-
-static void updateOled() {
-    if (!g_oledOk) return;
-    bool safe = (g_debounced == 1);
-
-    oled.clearDisplay();
-    oled.setTextColor(SSD1306_WHITE);
-
-    oled.setTextSize(2);
-    oled.setCursor(0, 0);
-    oled.print(safe ? "SAFE  " : "RAIN! ");
-
-    oled.setTextSize(1);
-    oled.setCursor(0, 16);
-    oled.print(WiFi.status() == WL_CONNECTED
-               ? WiFi.localIP().toString()
-               : "No WiFi");
-
-    oled.setCursor(0, 24);
-    oled.print(g_alpacaConn ? "Alpaca:OK" : "Alpaca:--");
-    oled.print(" T:");
-    oled.print(g_totalTrans);
-
-    oled.display();
-}
-
 // ── setup ─────────────────────────────────────────────────────────────────────
 
-void setup() {
+void setup()
+{
     Serial.begin(115200);
-    // Wait up to 3 s for USB CDC host to enumerate; continue anyway if no PC connected
-    {
-        uint32_t t = millis();
-        while (!Serial && (millis() - t) < 3000) delay(10);
-    }
     Serial.println("\n\n=== RG-11 Safety Monitor booting ===");
 
-    // OLED – initialise Wire with our custom pins BEFORE calling oled.begin()
-    // so the Adafruit BusIO layer doesn't reset them to the board defaults.
-    Wire.begin(OLED_SDA, OLED_SCL);
-
-    // I2C scan – auto-detect OLED address (0x3C or 0x3D)
-    bool oledFound = false;
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0 && (addr == 0x3C || addr == 0x3D) && !oledFound) {
-            g_oledAddr = addr;
-            oledFound  = true;
-        }
+    // Diagnostics record — RTC memory is garbage after a power cycle, so gate on
+    // both the magic and the reset reason before trusting it.
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (s_diag.magic != DIAG_MAGIC || rr == ESP_RST_POWERON) {
+        memset(&s_diag, 0, sizeof(s_diag));
+        s_diag.magic = DIAG_MAGIC;
     }
+    s_diag.bootCount++;
+    Serial.printf("Reset reason: %s (boot #%lu)\n", resetReasonName(),
+                  (unsigned long)s_diag.bootCount);
 
-    g_oledOk = oled.begin(SSD1306_SWITCHCAPVCC, g_oledAddr);
-    if (!g_oledOk) {
-        Serial.printf("SSD1306 not found at 0x%02X – check wiring\n", g_oledAddr);
-    } else {
-        Serial.printf("SSD1306 OK at 0x%02X\n", g_oledAddr);
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(0, 0);
-        oled.println("RG-11 Monitor");
-        oled.println("WiFi connecting...");
-        oled.display();
-    }
+    displayInit();
+    displayMessage("RG-11 Monitor", "WiFi connecting...");
 
-    // Rain sensor GPIO
+    // Rain sensor GPIO. Seed the debounce state from the real pin level so the
+    // device never reports SAFE during the first debounce window while it is
+    // actually raining.
     pinMode(RAIN_PIN, INPUT_PULLUP);
-    for (int i = 0; i < DEB_SAMPLES; i++) g_samples[i] = digitalRead(RAIN_PIN);
+    int initial = digitalRead(RAIN_PIN);
+    for (int i = 0; i < DEB_SAMPLES; i++) g_samples[i] = initial;
+    g_rawLevel  = initial;
+    g_debounced = initial;
 
-    // WiFi – 20-second timeout so a bad SSID/password doesn't hang forever
+    // WiFi — re-begin at 15 s, restart at 30 s
+    WiFi.persistent(false);        // don't wear out flash rewriting the same creds
     WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);          // modem sleep makes the link flaky under polling
+    WiFi.setAutoReconnect(true);   // first line of defence; maintainWifi() backs it up
+    WiFi.setHostname("rg11");
+    WiFi.onEvent(onWiFiEvent);     // must be registered before begin()
     WiFi.begin(WIFI_SSID, WIFI_PASS);
     Serial.print("Connecting to WiFi");
-    uint32_t wifiStart = millis();
-    while (WiFi.status() != WL_CONNECTED && (millis() - wifiStart) < 20000) {
-        delay(500);
-        Serial.print('.');
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\nWiFi FAILED – check SSID/password in secrets.h");
-    } else {
-        Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-    }
-    if (g_oledOk) {
-        oled.clearDisplay();
-        oled.setTextSize(1);
-        oled.setTextColor(SSD1306_WHITE);
-        oled.setCursor(0, 0);
-        if (WiFi.status() == WL_CONNECTED) {
-            oled.println("WiFi OK!");
-            oled.println(WiFi.localIP().toString());
-        } else {
-            oled.println("WiFi FAILED");
-            oled.println("Check secrets.h");
-        }
-        oled.display();
-        delay(2000);
-    }
+    {
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED) {
+            delay(500);
+            Serial.print('.');
+            ++attempts;
 
-    // Web status page – port 80 (human-readable, no port number needed in browser)
+            // Half way — tear the association down and start over. Cheaper than
+            // a reboot and clears a stuck WPA handshake.
+            if (attempts == BOOT_WIFI_REBEGIN_TRIES) {
+                Serial.print(" retrying");
+                WiFi.disconnect(true);
+                delay(200);
+                WiFi.mode(WIFI_STA);
+                WiFi.begin(WIFI_SSID, WIFI_PASS);
+            }
+
+            if (attempts >= BOOT_WIFI_MAX_TRIES) {
+                Serial.println("\nWiFi failed — restarting in 3 s");
+                displayMessage("WiFi FAILED", "Restarting...");
+                delay(3000);
+                ESP.restart();
+            }
+        }
+    }
+    Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+    displayMessage("WiFi OK!", WiFi.localIP().toString());
+
+    // Stable per-device Alpaca identity. A hardcoded UniqueID would collide with
+    // the unit this one replaces if both are powered on during changeover.
+    g_uniqueId = "RG11-SM-" + WiFi.macAddress();
+    g_uniqueId.replace(":", "");
+    Serial.printf("Alpaca UniqueID: %s\n", g_uniqueId.c_str());
+
+    // NTP — non-blocking, syncs in the background. Only needed so the event log
+    // carries wall-clock times that line up with N.I.N.A's log.
+    configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+    diagLog(EV_BOOT);
+
+    delay(1500);   // let the boot message be read
+
+    // Web status page – port 80 (human-readable, no port number needed)
     webServer.on("/",            HTTP_GET, hRoot);
     webServer.on("/favicon.ico", HTTP_GET, hFavicon);
     webServer.onNotFound(hNotFound80);
     webServer.begin();
-    Serial.println("Web status page on port 80");
+    Serial.printf("Web status page on port %d\n", INFO_PORT);
 
     // Alpaca API – port 11111
-    httpServer.on("/api/v1/safetymonitor/0/issafe",           HTTP_GET,  hIsSafe);
-    httpServer.on("/api/v1/safetymonitor/0/connected",        HTTP_GET,  hConnectedGet);
-    httpServer.on("/api/v1/safetymonitor/0/connected",        HTTP_PUT,  hConnectedPut);
-    httpServer.on("/api/v1/safetymonitor/0/description",      HTTP_GET,  hDescription);
-    httpServer.on("/api/v1/safetymonitor/0/driverinfo",       HTTP_GET,  hDriverInfo);
-    httpServer.on("/api/v1/safetymonitor/0/driverversion",    HTTP_GET,  hDriverVersion);
-    httpServer.on("/api/v1/safetymonitor/0/interfaceversion", HTTP_GET,  hInterfaceVersion);
-    httpServer.on("/api/v1/safetymonitor/0/name",             HTTP_GET,  hName);
-    httpServer.on("/api/v1/safetymonitor/0/supportedactions", HTTP_GET,  hSupportedActions);
-    httpServer.on("/api/v1/safetymonitor/0/devicestate",      HTTP_GET,  hDeviceState);
-    httpServer.on("/management/apiversions",                   HTTP_GET,  hMgmtApiVersions);
-    httpServer.on("/management/v1/description",                HTTP_GET,  hMgmtDescription);
-    httpServer.on("/management/v1/configureddevices",          HTTP_GET,  hMgmtDevices);
+    httpServer.on("/api/v1/safetymonitor/0/issafe",           HTTP_GET, hIsSafe);
+    httpServer.on("/api/v1/safetymonitor/0/connected",        HTTP_GET, hConnectedGet);
+    httpServer.on("/api/v1/safetymonitor/0/connected",        HTTP_PUT, hConnectedPut);
+    httpServer.on("/api/v1/safetymonitor/0/description",      HTTP_GET, hDescription);
+    httpServer.on("/api/v1/safetymonitor/0/driverinfo",       HTTP_GET, hDriverInfo);
+    httpServer.on("/api/v1/safetymonitor/0/driverversion",    HTTP_GET, hDriverVersion);
+    httpServer.on("/api/v1/safetymonitor/0/interfaceversion", HTTP_GET, hInterfaceVersion);
+    httpServer.on("/api/v1/safetymonitor/0/name",             HTTP_GET, hName);
+    httpServer.on("/api/v1/safetymonitor/0/supportedactions", HTTP_GET, hSupportedActions);
+    httpServer.on("/api/v1/safetymonitor/0/devicestate",      HTTP_GET, hDeviceState);
+    httpServer.on("/management/apiversions",                  HTTP_GET, hMgmtApiVersions);
+    httpServer.on("/management/v1/description",               HTTP_GET, hMgmtDescription);
+    httpServer.on("/management/v1/configureddevices",         HTTP_GET, hMgmtDevices);
     httpServer.onNotFound(hNotFound);
     httpServer.begin();
     Serial.printf("Alpaca API on port %d\n", ALPACA_PORT);
 
-    // Alpaca UDP discovery – AsyncUDP handles receive + reply on the same socket
-    if (asyncUdp.listen(DISC_PORT)) {
-        asyncUdp.onPacket([](AsyncUDPPacket packet) {
-            if (packet.length() < 16) return;
-            if (strncmp((char*)packet.data(), "alpacadiscovery1", 16) != 0) return;
-            String resp =
-                "{\"AlpacaPort\":" + String(ALPACA_PORT) +
-                ",\"Devices\":[{\"DeviceType\":\"SafetyMonitor\","
-                "\"DeviceName\":\"RG-11 Safety Monitor\","
-                "\"DeviceNumber\":0,\"UniqueID\":\"ESP32C3-RG11-SM-0\"}]}";
-            packet.print(resp);
-        });
-        Serial.printf("Alpaca discovery on UDP port %d\n", DISC_PORT);
-    } else {
-        Serial.println("AsyncUDP listen FAILED");
-    }
+    startDiscovery();
 
-    g_lastChange    = millis();
-    g_nextDebounce  = millis() + DEB_INTERVAL_MS;
-    g_nextOled      = millis() + 1000;
+    g_lastChange   = millis();
+    g_nextDebounce = millis() + DEB_INTERVAL_MS;
+    g_nextDisplay  = millis() + 1000;
+
+    // Hardware task watchdog — armed last so a slow setup() can't trip it.
+    // If loop() stops feeding it for WDT_TIMEOUT_S the chip resets.
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms     = WDT_TIMEOUT_S * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    // Core 3.x may already have initialised the TWDT — reconfigure in that case.
+    if (esp_task_wdt_init(&wdtCfg) == ESP_ERR_INVALID_STATE) {
+        esp_task_wdt_reconfigure(&wdtCfg);
+    }
+#else
+    esp_task_wdt_init(WDT_TIMEOUT_S, true);
+#endif
+    esp_task_wdt_add(NULL);   // watch the Arduino loop task
+    Serial.printf("Task watchdog armed (%d s)\n", WDT_TIMEOUT_S);
 
     Serial.println("=== Setup complete – entering loop ===");
+    displayUpdate();
 }
 
 // ── loop ──────────────────────────────────────────────────────────────────────
 
-void loop() {
+void loop()
+{
+    esp_task_wdt_reset();   // feed the hardware watchdog
+
     uint32_t now = millis();
 
     webServer.handleClient();
     httpServer.handleClient();
-    // Discovery is handled by AsyncUDP callback – nothing to poll here
+    // Discovery is handled by the AsyncUDP callback – nothing to poll here
 
-    // WiFi watchdog – reconnect automatically if connection drops
-    if (WiFi.status() != WL_CONNECTED && (int32_t)(now - g_nextWifiRetry) >= 0) {
-        g_nextWifiRetry = now + 30000;   // retry at most every 30 s
-        Serial.println("WiFi lost – reconnecting...");
-        WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
-    }
+    maintainWifi();
 
     if ((int32_t)(now - g_nextDebounce) >= 0) {
         g_nextDebounce = now + DEB_INTERVAL_MS;
         runDebounce();
     }
 
-    if ((int32_t)(now - g_nextOled) >= 0) {
-        g_nextOled = now + 1000;
-        updateOled();
+    if ((int32_t)(now - g_nextDisplay) >= 0) {
+        g_nextDisplay = now + 1000;
+        displayUpdate();
     }
 
     if ((int32_t)(now - g_nextHeartbeat) >= 0) {
         g_nextHeartbeat = now + 30000;
-        Serial.printf("HB: OLED=%s(0x%02X) GPIO%d=%d safe=%s WiFi=%s\n",
-                      g_oledOk ? "OK" : "FAIL", g_oledAddr,
+        Serial.printf("HB: GPIO%d=%d safe=%s WiFi=%s RSSI=%d heap=%u drops=%lu\n",
                       RAIN_PIN, g_rawLevel,
                       g_debounced ? "Y" : "N",
                       WiFi.status() == WL_CONNECTED
                           ? WiFi.localIP().toString().c_str()
-                          : "DOWN");
+                          : "DOWN",
+                      WiFi.RSSI(), (unsigned)ESP.getFreeHeap(),
+                      (unsigned long)s_wifiDropCount);
+
+        // Heap floor — the String-building handlers are the only plausible leak
+        // source; reboot before the allocator starts failing requests.
+        if (ESP.getFreeHeap() < HEAP_FLOOR_BYTES) {
+            safeRestart("low heap");
+        }
     }
 }
