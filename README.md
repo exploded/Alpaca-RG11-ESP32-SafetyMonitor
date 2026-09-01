@@ -164,19 +164,28 @@ logged before the clock syncs render as `+123s (no clock)`.
 
 ## Reliability
 
-Three independent layers, so no single stuck component leaves the device
+Four independent layers, so no single stuck component leaves the device
 unreachable until someone power-cycles it.
 
 | Layer | Trigger | Action |
 |-------|---------|--------|
 | **Task watchdog** | `loop()` stops running for 30 s (hung handler, wedged network stack) | Chip resets; next boot reports `Last reset: TASK WATCHDOG` |
 | **WiFi supervisor** | Link drops | Event-driven detection → immediate re-associate → 4 retries × 15 s grace → reboot after ~60 s down |
+| **Poll-stall supervisor** | A connected client's polls stop for 35 s while the link claims to be up | Log `polls stopped (link up)` → force a re-association at 70 s → disarm after 10 min (client presumed gone) |
 | **Boot WiFi timeout** | Can't associate at startup | Re-`begin()` at 15 s, reboot at 30 s |
 | **Heap floor** | Free heap < 40 kB | Reboot before the allocator starts failing requests |
 
+The poll-stall supervisor exists because of a real failure (2026-08-31 17:41
+and 2026-09-01 01:19): the association stayed up — so the WiFi supervisor saw
+nothing — while traffic to this one device blackholed for about a minute.
+N.I.N.A's polls timed out, it failed safe and shut the observatory down. The
+supervisor arms on `PUT connected=true` or a `GET issafe`, and disarms on
+`PUT connected=false` so a deliberately closed N.I.N.A doesn't cause
+re-association flapping overnight.
+
 Supporting settings: `WiFi.setSleep(false)` (modem sleep makes the link flaky
-under the status page's 500 ms polling), `WiFi.setAutoReconnect(true)`,
-`WiFi.persistent(false)` (avoids flash wear rewriting the same credentials).
+under polling), `WiFi.setAutoReconnect(true)`, `WiFi.persistent(false)`
+(avoids flash wear rewriting the same credentials).
 
 The debounce state is seeded from the actual pin level at boot, so the device
 never reports SAFE during the first debounce window while it is actually
@@ -187,11 +196,15 @@ raining.
 ## Status page (port 80)
 
 Open `http://<IP>/` in any browser — no port number needed. The page
-auto-refreshes every 10 s, and the live SAFE/NOT SAFE line updates every 500 ms.
+auto-refreshes every 10 s, and the live SAFE/NOT SAFE line updates every 2 s
+from `/status.json` on port 80. Browsers deliberately never touch port 11111:
+the Arduino `WebServer` handles one client at a time, so N.I.N.A must be the
+Alpaca port's only client.
 
 ```
-Status        SAFE / NOT SAFE · GPIO 27 level · transitions · Alpaca · IP
-Link          Uptime · WiFi RSSI · WiFi drops since boot · Free heap
+Status        SAFE / NOT SAFE · GPIO 27 level · transitions · last Alpaca poll
+              · client armed/idle · IP
+Link          Uptime · WiFi RSSI · WiFi drops since boot · poll stalls · heap
 Diagnostics   Last reset · Boots since power-on · WiFi drops since power-on
               Clock · event table (When | Event), newest first
 ```
@@ -202,8 +215,10 @@ overnight self-reboot keeps its history, while pulling the plug gives a clean
 slate. "Since power-on" counters mean exactly what they say.
 
 Logged events: `boot`, `WiFi lost` (with the 802.11 reason code decoded),
-`WiFi recovered`, `self-reboot`, `RAIN — unsafe`, `dry — safe`. The rain events
-give a usable overnight rain history.
+`WiFi recovered`, `self-reboot`, `RAIN — unsafe`, `dry — safe`,
+`polls stopped (link up)`, `polls resumed` (with the outage length). The rain
+events give a usable overnight rain history; the poll events give a forensic
+trail for client-side connection losses that the device otherwise can't see.
 
 ---
 
@@ -226,6 +241,7 @@ confuse the client.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Live status, link health and diagnostics |
+| GET | `/status.json` | Live data for the page's JS (safe, GPIO, last poll age, stalls, RSSI, heap) |
 
 ### ASCOM Alpaca API (port 11111)
 
@@ -259,7 +275,7 @@ red NOT SAFE** — around a black centre carrying the text.
    │███               ███│
    │██     SAFE        ██│   headline (FreeSansBold 18pt)
    │██  192.168.1.45   ██│   IP address
-   │███ Alpaca:OK T:3 ███│   Alpaca state + transition count
+   │███ Alpaca:OK T:3 ███│   client polled <30 s ago + transition count
     ╰███ -38dBm up 12m ██╯   link health
       ╰███████████████╯
         ╰───────────╯

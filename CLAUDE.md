@@ -46,6 +46,17 @@ Both live in `C:\Projects\devices`. Check them before reinventing anything here.
 
 ## Reliability layers — don't remove these
 
+- **Poll-stall supervisor** `maintainStall()`: catches the failure the WiFi
+  supervisor can't — association up but traffic blackholed (seen 2026-08-31
+  17:41 and 2026-09-01 01:19; NINA timed out and shut the observatory down
+  while the device logged nothing). Arms on `PUT connected=true` / `GET
+  issafe`, disarms on `PUT connected=false`. Escalation: log EV_NET_STALL at
+  35 s of silence → `WiFi.disconnect()` at 70 s (maintainWifi drives the
+  recovery) → give up at 10 min so a closed NINA doesn't cause flapping.
+  Related: the status page JS polls `/status.json` on **port 80** — browsers
+  must never hit port 11111, WebServer serves one client at a time and NINA
+  owns that port.
+
 - **Task watchdog** armed at the *end* of `setup()` (so a slow boot can't trip
   it), fed by `esp_task_wdt_reset()` as the first statement in `loop()`.
   The `ESP_ARDUINO_VERSION_MAJOR >= 3` guard is deliberate: the

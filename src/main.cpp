@@ -57,6 +57,21 @@
 #define BOOT_WIFI_MAX_TRIES       60       // 60 x 500 ms = 30 s, then reboot
 #define HEAP_FLOOR_BYTES      40000UL      // reboot below this much free heap
 
+// 4. Poll-stall supervisor — catches the failure the WiFi supervisor can't see:
+//    the association stays up (so no disconnect event ever fires) but traffic
+//    to this one device blackholes for a minute, N.I.N.A's polls time out, and
+//    it fails safe and shuts the observatory down. Observed 2026-08-31 17:41
+//    and 2026-09-01 01:19 — zero events on the device either time, while the
+//    roof controller answered fine seconds later.
+//    While a client is armed (PUT connected=true or a GET issafe), silence on
+//    the Alpaca API escalates: log it -> re-associate (rebuilds AP client
+//    state) -> give up and disarm, so a N.I.N.A that was simply closed doesn't
+//    cause reconnect flapping all night.
+#define STALL_CHECK_MS         5000UL      // how often to evaluate
+#define STALL_WARN_MS         35000UL      // quiet this long -> log EV_NET_STALL
+#define STALL_REASSOC_MS      70000UL      // still quiet -> force re-associate
+#define STALL_GIVEUP_MS      600000UL      // still quiet -> assume client gone
+
 // ── Time (house convention: Melbourne, DST handled by configTzTime) ───────────
 static const char *TZ_INFO      = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
 static const char *NTP_SERVER_1 = "pool.ntp.org";
@@ -118,7 +133,9 @@ static uint32_t g_nextHeartbeat = 0;
 #define DIAG_EVENTS  12
 
 enum DiagEvent : uint8_t {
-    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_RAIN, EV_DRY
+    EV_NONE = 0, EV_BOOT, EV_WIFI_LOST, EV_WIFI_OK, EV_REBOOT, EV_RAIN, EV_DRY,
+    EV_NET_STALL,   // client polls stopped while the link claimed to be up
+    EV_NET_OK       // polls resumed; detail = outage length in 10 s units
 };
 
 struct DiagEntry {
@@ -147,6 +164,8 @@ static const char *diagEventName(uint8_t t)
         case EV_REBOOT:    return "self-reboot";
         case EV_RAIN:      return "RAIN — unsafe";
         case EV_DRY:       return "dry — safe";
+        case EV_NET_STALL: return "polls stopped (link up)";
+        case EV_NET_OK:    return "polls resumed";
         default:           return "";
     }
 }
@@ -243,12 +262,37 @@ static String diagCardHtml()
             what += " — reason " + String(e.detail);
             const char *rn = wifiReasonName(e.detail);
             if (rn[0]) what += " (" + String(rn) + ")";
+        } else if (e.type == EV_NET_OK && e.detail) {
+            what += " — after ~" + String((uint32_t)e.detail * 10) + " s";
         }
         h += "<tr><td><code>" + diagWhen(e) + "</code></td><td>" + what + "</td></tr>";
     }
     if (!any) h += "<tr><td colspan='2'>no events recorded</td></tr>";
     h += "</table></div>";
     return h;
+}
+
+// ── Poll-stall supervisor state ───────────────────────────────────────────────
+static bool     g_clientArmed   = false;  // a client is (or was) actively polling
+static uint32_t g_lastAlpacaMs  = 0;      // last request on the Alpaca API
+static uint8_t  g_stallStage    = 0;      // 0 quiet-ok, 1 warned, 2 re-associated
+static uint32_t g_stallCount    = 0;      // episodes since boot (status page)
+static uint32_t g_lastStallCheckMs = 0;
+
+// Every Alpaca response funnels through here. `arms` is true only for the
+// requests that prove a client session is live (issafe polls, connect PUT) —
+// a passing discovery scan of the management API must not arm the detector.
+static void noteAlpaca(bool arms)
+{
+    if (g_stallStage != 0) {
+        uint32_t gap = millis() - g_lastAlpacaMs;
+        diagLog(EV_NET_OK, (uint8_t)min(gap / 10000UL, 255UL));
+        Serial.printf("Polls resumed after %lus (stage %u)\n",
+                      (unsigned long)(gap / 1000UL), g_stallStage);
+        g_stallStage = 0;
+    }
+    g_lastAlpacaMs = millis();
+    if (arms) g_clientArmed = true;
 }
 
 // ── WiFi supervisor state ─────────────────────────────────────────────────────
@@ -345,8 +389,12 @@ static void displayUpdate()
     gfx->setTextColor(COL_TEXT, COL_BG);
     gfx->drawString(up ? WiFi.localIP().toString() : String("No WiFi"), CX, 142);
 
+    // "Alpaca:OK" now means a client polled within the last 30 s, so the screen
+    // itself shows when N.I.N.A's polls stop reaching us — the failure mode
+    // that used to be invisible here.
+    const bool polled = g_alpacaConn && (millis() - g_lastAlpacaMs < 30000UL);
     gfx->setTextColor(COL_DIM, COL_BG);
-    gfx->drawString(String(g_alpacaConn ? "Alpaca:OK" : "Alpaca:--") +
+    gfx->drawString(String(polled ? "Alpaca:OK" : "Alpaca:--") +
                     "  T:" + String(g_totalTrans), CX, 168);
 
     gfx->setTextFont(1);
@@ -454,6 +502,40 @@ static void maintainWifi()
     s_wifiDownSinceMs = millis();
 }
 
+// ── Poll-stall supervisor ─────────────────────────────────────────────────────
+// Polled from loop(). Only acts while the link *claims* to be up — when it is
+// actually down the WiFi supervisor owns recovery.
+static void maintainStall()
+{
+    if (millis() - g_lastStallCheckMs < STALL_CHECK_MS) return;
+    g_lastStallCheckMs = millis();
+
+    if (!g_clientArmed || WiFi.status() != WL_CONNECTED) return;
+
+    uint32_t quiet = millis() - g_lastAlpacaMs;
+
+    if (g_stallStage == 0 && quiet > STALL_WARN_MS) {
+        g_stallStage = 1;
+        g_stallCount++;
+        diagLog(EV_NET_STALL);
+        Serial.printf("Client polls stopped %lus ago but WiFi is up\n",
+                      (unsigned long)(quiet / 1000UL));
+    } else if (g_stallStage == 1 && quiet > STALL_REASSOC_MS) {
+        // Re-associate: rebuilds the AP's client state and renegotiates rates,
+        // which is the strongest repair available short of a reboot. The WiFi
+        // supervisor sees the drop and drives the reconnect + discovery re-arm.
+        g_stallStage = 2;
+        Serial.println("Still no polls — forcing re-association");
+        WiFi.disconnect();
+    } else if (g_stallStage == 2 && quiet > STALL_GIVEUP_MS) {
+        // Client is genuinely gone (N.I.N.A closed or the PC is off). Disarm so
+        // an idle device doesn't re-associate all night.
+        g_stallStage  = 0;
+        g_clientArmed = false;
+        Serial.println("No polls for 10 min — client presumed gone, disarming");
+    }
+}
+
 // ── Alpaca response helpers ───────────────────────────────────────────────────
 
 static void addCors()
@@ -472,6 +554,7 @@ static uint32_t clientTx()
 static void sendBool(bool v)
 {
     g_alpacaConn = true;
+    noteAlpaca(false);
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
@@ -484,6 +567,7 @@ static void sendBool(bool v)
 static void sendInt(int v)
 {
     g_alpacaConn = true;
+    noteAlpaca(false);
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
@@ -495,6 +579,7 @@ static void sendInt(int v)
 static void sendStr(const char *v)
 {
     g_alpacaConn = true;
+    noteAlpaca(false);
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
@@ -505,6 +590,7 @@ static void sendStr(const char *v)
 
 static void sendArr(const String &v)
 {
+    noteAlpaca(false);
     uint32_t tx = clientTx(), stx = g_serverTxId++;
     addCors();
     httpServer.send(200, "application/json",
@@ -515,11 +601,25 @@ static void sendArr(const String &v)
 
 // ── Status page (port 80) ─────────────────────────────────────────────────────
 
+// Live data for the status page. Served on port 80 so browsers never touch the
+// Alpaca port — N.I.N.A must be the only client on 11111. (The page previously
+// fetched issafe cross-port at 2 Hz, competing with N.I.N.A for the
+// one-client-at-a-time WebServer.)
+static void hStatusJson()
+{
+    String j = "{\"safe\":" + String(g_debounced == 1 ? "true" : "false") +
+        ",\"gpio\":" + String(g_rawLevel) +
+        ",\"lastPollSec\":" +
+        (g_alpacaConn ? String((millis() - g_lastAlpacaMs) / 1000UL) : String(-1)) +
+        ",\"clientArmed\":" + (g_clientArmed ? "true" : "false") +
+        ",\"stalls\":" + String(g_stallCount) +
+        ",\"rssi\":" + String(WiFi.RSSI()) +
+        ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
+    webServer.send(200, "application/json", j);
+}
+
 static void hRoot()
 {
-    // The Alpaca API is on port 11111; build the absolute base URL so the JS
-    // fetch works correctly even though this page is served from port 80.
-    String apiBase = "http://" + WiFi.localIP().toString() + ":" + String(ALPACA_PORT);
     String html =
         "<html><head><meta charset='UTF-8'>"
         "<meta http-equiv='refresh' content='10'>"
@@ -537,38 +637,55 @@ static void hRoot()
         "<p><strong>Status:</strong> <span id='s'>--</span></p>"
         "<p><strong>GPIO " + String(RAIN_PIN) + ":</strong> <span id='r'>--</span></p>"
         "<p><strong>Transitions:</strong> " + String(g_totalTrans) +
-        " | <strong>Alpaca:</strong> " + (g_alpacaConn ? "Connected" : "Disconnected") +
+        " | <strong>Last Alpaca poll:</strong> <span id='p'>--</span>"
+        " | <strong>Client:</strong> " + (g_clientArmed ? "armed" : "idle") +
         " | <strong>IP:</strong> " + WiFi.localIP().toString() + "</p></div>"
 
         "<div class='card'><h2>Link</h2>"
         "<p><strong>Uptime:</strong> " + String(millis() / 60000UL) + " min</p>"
         "<p><strong>WiFi RSSI:</strong> " + String(WiFi.RSSI()) + " dBm</p>"
         "<p><strong>WiFi drops since boot:</strong> " + String(s_wifiDropCount) + "</p>"
+        "<p><strong>Poll stalls since boot:</strong> " + String(g_stallCount) + "</p>"
         "<p><strong>Free heap:</strong> " + String(ESP.getFreeHeap()) + " bytes</p>"
         "</div>"
 
         + diagCardHtml() +
 
-        "<script>var B='" + apiBase + "';"
-        "function u(){"
-        "fetch(B+'/api/v1/safetymonitor/0/issafe').then(r=>r.json()).then(d=>{"
-        "const s=d.Value===true;"
-        "document.getElementById('s').innerHTML=s?"
+        "<script>function u(){"
+        "fetch('/status.json').then(r=>r.json()).then(d=>{"
+        "document.getElementById('s').innerHTML=d.safe?"
         "'<span class=\"safe\">SAFE</span>':'<span class=\"unsafe\">NOT SAFE (RAIN)</span>';"
-        "document.getElementById('r').innerHTML=s?"
+        "document.getElementById('r').innerHTML=d.safe?"
         "'<span style=\"color:green\">HIGH (1)</span>'"
         ":'<span style=\"color:red\">LOW (0)</span>';"
+        "document.getElementById('p').textContent="
+        "d.lastPollSec<0?'never':d.lastPollSec+' s ago';"
         "}).catch(()=>{document.getElementById('s').innerHTML='Error';});}"
-        "setInterval(u,500);u();</script></body></html>";
+        "setInterval(u,2000);u();</script></body></html>";
     webServer.send(200, "text/html", html);
 }
 
 // ── Alpaca handlers ───────────────────────────────────────────────────────────
 
 static void hFavicon()          { webServer.send(404); }
-static void hIsSafe()           { sendBool(g_debounced == 1); }
-static void hConnectedGet()     { sendBool(true); }
-static void hConnectedPut()     { g_alpacaConn = true; sendBool(true); }
+static void hIsSafe()           { noteAlpaca(true); sendBool(g_debounced == 1); }
+static void hConnectedGet()     { noteAlpaca(true); sendBool(true); }
+
+static void hConnectedPut()
+{
+    // Connected=False is the client saying goodbye — disarm the poll-stall
+    // supervisor so the ensuing silence isn't treated as a network failure.
+    String v = httpServer.arg("Connected");
+    bool connecting = !v.equalsIgnoreCase("false");
+    noteAlpaca(connecting);
+    if (!connecting) {
+        g_clientArmed = false;
+        g_stallStage  = 0;
+        Serial.println("Client disconnected (PUT Connected=False)");
+    }
+    g_alpacaConn = true;
+    sendBool(true);
+}
 static void hDescription()      { sendStr("Hydreon RG-11 Optical Rain Sensor Safety Monitor"); }
 static void hDriverInfo()       { sendStr("ESP32 Alpaca Safety Monitor (Arduino)"); }
 static void hDriverVersion()    { sendStr("3.0.0"); }
@@ -718,6 +835,7 @@ void setup()
 
     // Web status page – port 80 (human-readable, no port number needed)
     webServer.on("/",            HTTP_GET, hRoot);
+    webServer.on("/status.json", HTTP_GET, hStatusJson);
     webServer.on("/favicon.ico", HTTP_GET, hFavicon);
     webServer.onNotFound(hNotFound80);
     webServer.begin();
@@ -782,6 +900,7 @@ void loop()
     // Discovery is handled by the AsyncUDP callback – nothing to poll here
 
     maintainWifi();
+    maintainStall();
 
     if ((int32_t)(now - g_nextDebounce) >= 0) {
         g_nextDebounce = now + DEB_INTERVAL_MS;
