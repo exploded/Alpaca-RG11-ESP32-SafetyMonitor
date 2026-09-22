@@ -90,6 +90,12 @@
 #define WIFI_BSSID_WAIT_MS      8000UL     // per-BSSID connect timeout
 #define WIFI_ANY_WAIT_MS       15000UL     // plain connect timeout (driver picks the AP)
 #define ROAM_POLL_ALIGN_MS     10000UL     // max wait for a client poll to slot a roam step behind
+#ifndef ROAM_LEAVE_SETTLE_MS
+#define ROAM_LEAVE_SETTLE_MS     300UL     // after the old AP's disconnect event, before begin() on the new one
+#endif
+#ifndef ROAM_LEAVE_MAX_MS
+#define ROAM_LEAVE_MAX_MS       1500UL     // begin() anyway if no disconnect event arrives by then
+#endif
 #define ROAM_REJECT_HOLDOFF_MS 3600000UL   // don't roam back to a BSSID that refused us for 1 h
 #define ROAM_SKIP_RELOG_MS     3600000UL   // repeat an identical "roam skipped" log at most hourly
 
@@ -481,7 +487,8 @@ enum LinkState : uint8_t {
     LS_TRY_BSSID,   // connecting to s_cand[s_candIdx]
     LS_TRY_ANY,     // plain connect, the driver chooses
     LS_ROAM_SCAN,   // async scan while still associated
-    LS_ROAM_WAIT    // roam decided; waiting for the gap after a client poll
+    LS_ROAM_WAIT,   // roam decided; waiting for the gap after a client poll
+    LS_ROAM_LEAVE   // roam under way: old AP dropped, waiting for it to settle
 };
 
 struct ApCand {
@@ -497,6 +504,8 @@ static uint8_t   s_candIdx    = 0;       // next candidate to try
 static uint32_t  s_linkStepMs = 0;       // when the current scan / attempt started
 static bool      s_tryGotIp   = false;   // GOT_IP seen during the current attempt
 static bool      s_scanStarted = false;  // LS_SCAN: settle gap over, scan running
+static bool      s_roamLeft    = false;  // LS_ROAM_LEAVE: the old AP's disconnect event has arrived
+static uint32_t  s_roamLeftMs  = 0;      // ...at this time
 
 // Roaming
 static bool      s_roaming         = false;  // current attempt is a planned roam
@@ -1050,7 +1059,27 @@ static void maintainWifi()
                 s_lastSkipReason  = RS_NONE;        // so this cooldown's skip gets logged
                 s_wifiDownSinceMs = millis();
                 s_candIdx         = 0;
-                wifiTryNext();                      // begin() drops the old AP itself
+                // Leave the old AP first and let it settle. Core 2.0.17's
+                // begin() disconnects and reconnects back to back, which from a
+                // live association races the teardown. Ported from the roof
+                // controller as a precaution: it did not fix the roof's bench
+                // roam failures (targets there were -71..-88 dBm), and no roam
+                // has yet been seen to succeed on either device.
+                WiFi.disconnect();
+                s_roamLeft   = false;
+                s_linkStepMs = millis();
+                s_link       = LS_ROAM_LEAVE;
+            }
+            return;
+
+        case LS_ROAM_LEAVE:
+            if (evDisc && !s_roamLeft) { s_roamLeft = true; s_roamLeftMs = millis(); }
+            if ((s_roamLeft && millis() - s_roamLeftMs >= ROAM_LEAVE_SETTLE_MS) ||
+                millis() - s_linkStepMs >= ROAM_LEAVE_MAX_MS) {
+                Serial.printf("Roam: left old AP (disconnect event %s), %lu ms since leaving\n",
+                              s_roamLeft ? "seen" : "NOT seen",
+                              (unsigned long)(millis() - s_linkStepMs));
+                wifiTryNext();   // target first, then the other candidates incl. the old AP
             }
             return;
 
@@ -1229,6 +1258,7 @@ static String roamStateStr()
     switch (s_link) {
         case LS_ROAM_SCAN: return "scanning";
         case LS_ROAM_WAIT: return "roaming at next poll gap";
+        case LS_ROAM_LEAVE: return "roaming";
         case LS_UP:        break;
         default:           return "connecting";
     }

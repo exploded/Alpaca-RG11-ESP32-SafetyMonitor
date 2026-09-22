@@ -79,6 +79,12 @@ Both live in `C:\Projects\devices`. Check them before reinventing anything here.
   (`pollGapOk`), cooldown after every attempt. Thresholds are one `#ifndef`
   block near the top; `[env:roamtest]` overrides them for bench tests, and
   `default_envs = esp32dev` keeps a plain `pio run -t upload` on production.
+  A roam disconnects first and waits 300 ms after the disconnect event before
+  `begin()` on the target (`LS_ROAM_LEAVE`), ported from the roof controller.
+  **No roam has yet succeeded on either device.** On the roof controller's
+  bench every target (ch 6, −71..−88 dBm) refused or timed out even with a
+  3 s gap, so whether roaming works at all is still open — test where a
+  second AP is strong. Scans taken while associated ran 6.5–7 s there.
 - **Async scan gotchas (core 2.0.17, measured on hardware):** an async scan
   started straight after `WiFi.disconnect()` is silently aborted — no
   SCAN_DONE ever — hence `WIFI_SCAN_SETTLE_MS`. And the core's scan timeout
