@@ -52,7 +52,10 @@ Both live in `C:\Projects\devices`. Check them before reinventing anything here.
   while the device logged nothing). Arms on `PUT connected=true` / `GET
   issafe`, disarms on `PUT connected=false`. Escalation: log EV_NET_STALL at
   35 s of silence → `WiFi.disconnect()` at 70 s (maintainWifi drives the
-  recovery) → give up at 10 min so a closed NINA doesn't cause flapping.
+  recovery) → give up at 10 min (logged; stage 3 so the full gap is logged on
+  resume) so a closed NINA doesn't cause flapping. Silence is timed from the
+  later of the last poll and link-up. The armed flag is mirrored in RTC
+  (`s_diag.clientArmed`) so an outage spanning a self-reboot is still caught.
   Related: the status page JS polls `/status.json` on **port 80** — browsers
   must never hit port 11111, WebServer serves one client at a time and NINA
   owns that port.
@@ -62,9 +65,29 @@ Both live in `C:\Projects\devices`. Check them before reinventing anything here.
   The `ESP_ARDUINO_VERSION_MAJOR >= 3` guard is deliberate: the
   `esp_task_wdt_init()` signature changed between cores. Installed core is
   **2.0.17**, so the `#else` branch is what actually compiles today.
-- **WiFi supervisor** `maintainWifi()`: event-driven detection → re-associate →
-  reboot after ~60 s down. `onWiFiEvent()` only raises flags —
-  **never call `WiFi.begin()`/`disconnect()` from the event task context.**
+- **WiFi supervisor** `maintainWifi()`: event-driven detection → connect pass
+  (async all-channel scan → each BSSID strongest-first → plain connect) →
+  reboot after 90 s down. Boot uses the same sequencer. `onWiFiEvent()` only
+  bumps counters — **never call `WiFi.begin()`/`disconnect()` from the event
+  task context.**
+- **Core auto-reconnect is OFF on purpose.** In core 2.0.17 it calls
+  `WiFi.begin()` with the stored config, which after a BSSID-targeted connect
+  pins that BSSID — it would retry an AP that refuses us (UniFi Lock to AP)
+  forever, racing the sequencer.
+- **Roam watch** `maintainRoam()`: sustained weak RSSI → scan while connected →
+  roam only if ≥ hysteresis stronger, timed just after a client poll
+  (`pollGapOk`), cooldown after every attempt. Thresholds are one `#ifndef`
+  block near the top; `[env:roamtest]` overrides them for bench tests, and
+  `default_envs = esp32dev` keeps a plain `pio run -t upload` on production.
+- **Async scan gotchas (core 2.0.17, measured on hardware):** an async scan
+  started straight after `WiFi.disconnect()` is silently aborted — no
+  SCAN_DONE ever — hence `WIFI_SCAN_SETTLE_MS`. And the core's scan timeout
+  (20× dwell) can fire before a scan taken while associated finishes; the late
+  SCAN_DONE still delivers results, hence `wifiScanPoll()` /
+  `WIFI_SCAN_GIVEUP_MS`.
+- In `LS_TRY_*` states, disconnect reason 8 (ASSOC_LEAVE) is ignored — it is our
+  own `begin()` dropping the old AP. Success requires a fresh GOT_IP, because
+  `WiFi.status()` still reads WL_CONNECTED for a moment after a roam's `begin()`.
 - **Heap floor** at 40 kB. The HTTP handlers build responses with `String`
   concatenation, which is the only plausible leak source.
 - **Debounce seeded from the real pin level** in `setup()`. It used to default

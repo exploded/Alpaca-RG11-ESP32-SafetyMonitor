@@ -170,9 +170,9 @@ unreachable until someone power-cycles it.
 | Layer | Trigger | Action |
 |-------|---------|--------|
 | **Task watchdog** | `loop()` stops running for 30 s (hung handler, wedged network stack) | Chip resets; next boot reports `Last reset: TASK WATCHDOG` |
-| **WiFi supervisor** | Link drops | Event-driven detection → immediate re-associate → 4 retries × 15 s grace → reboot after ~60 s down |
-| **Poll-stall supervisor** | A connected client's polls stop for 35 s while the link claims to be up | Log `polls stopped (link up)` → force a re-association at 70 s → disarm after 10 min (client presumed gone) |
-| **Boot WiFi timeout** | Can't associate at startup | Re-`begin()` at 15 s, reboot at 30 s |
+| **WiFi supervisor** | Link drops (or can't associate at boot) | Event-driven detection → connect pass: all-channel scan → each BSSID strongest-first → plain connect → repeat → reboot after 90 s down |
+| **Roam watch** | RSSI below −72 dBm on every 60 s sample for 5 min | Scan while still connected; roam only to an AP ≥ 10 dB stronger, timed just after a client poll; 15 min cooldown |
+| **Poll-stall supervisor** | A connected client's polls stop for 35 s while the link claims to be up | Log `polls stopped (link up)` → force a re-association at 70 s → log `client presumed gone` and disarm after 10 min |
 | **Heap floor** | Free heap < 40 kB | Reboot before the allocator starts failing requests |
 
 The poll-stall supervisor exists because of a real failure (2026-08-31 17:41
@@ -183,9 +183,49 @@ supervisor arms on `PUT connected=true` or a `GET issafe`, and disarms on
 `PUT connected=false` so a deliberately closed N.I.N.A doesn't cause
 re-association flapping overnight.
 
+Silence is timed from the later of the last poll and the link coming up, so a
+WiFi recovery doesn't immediately trigger a second forced disconnect. The armed
+flag and a stall counter live in RTC memory, so an outage that spans a
+self-reboot is still logged.
+
 Supporting settings: `WiFi.setSleep(false)` (modem sleep makes the link flaky
-under polling), `WiFi.setAutoReconnect(true)`, `WiFi.persistent(false)`
-(avoids flash wear rewriting the same credentials).
+under polling), `WiFi.persistent(false)` (avoids flash wear rewriting the same
+credentials), and `WiFi.setAutoReconnect(false)`. The supervisor owns every
+reconnect, because the core's auto-reconnect reuses the last config, which may
+pin a BSSID that is refusing the device.
+
+### Access point selection and roaming
+
+Several UniFi APs broadcast the same SSID. The ESP32 default is a fast scan that
+joins the first match in channel order and never roams, which left this device
+on a distant AP at −74 to −81 dBm while the observatory AP was at −49 dBm.
+
+- **Connect:** every connect (boot, drop, stall-forced, roam) scans all
+  channels, then tries each BSSID strongest-first, directly on its channel, then
+  falls back to a plain connect. APs below the minimum RSSI are only tried after
+  every stronger one has refused, so the device still gets online if they are
+  all that's left. An AP that refuses a connect (for example, UniFi
+  **Lock to AP** pinned elsewhere) is tried last for the next hour and isn't
+  used as a roam target.
+- **Roam:** a link only counts as weak after staying below the trigger on every
+  sample for the sustain period. The scan runs while still connected, and the
+  switch waits for the gap just after a client poll, so N.I.N.A's next poll
+  lands on the new AP. The gap is typically 1–3 s.
+
+All thresholds are in one block near the top of `src/main.cpp`, and each can be
+overridden with a `-D` build flag:
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `WIFI_MIN_RSSI` | −75 dBm | Weaker APs are tried only after every stronger one refused |
+| `ROAM_TRIGGER_RSSI` | −72 dBm | Consider roaming only below this |
+| `ROAM_SUSTAIN_MS` | 300000 (5 min) | ...on every sample for this long |
+| `ROAM_HYSTERESIS_DB` | 10 dB | Target must beat the current AP by this much |
+| `ROAM_COOLDOWN_MS` | 900000 (15 min) | No roam attempt this soon after the last one |
+| `ROAM_CHECK_INTERVAL_MS` | 60000 (60 s) | RSSI sample period |
+
+`[env:roamtest]` in `platformio.ini` sets test values that force a roam on the
+bench: `pio run -e roamtest -t upload`. Flash `esp32dev` again afterwards.
 
 The debounce state is seeded from the actual pin level at boot, so the device
 never reports SAFE during the first debounce window while it is actually
@@ -203,9 +243,11 @@ Alpaca port's only client.
 
 ```
 Status        SAFE / NOT SAFE · GPIO 27 level · transitions · last Alpaca poll
-              · client armed/idle · IP
-Link          Uptime · WiFi RSSI · WiFi drops since boot · poll stalls · heap
-Diagnostics   Last reset · Boots since power-on · WiFi drops since power-on
+              · client armed / gone / idle · IP
+Link          Uptime · WiFi RSSI · access point (BSSID · channel · RSSI)
+              · roam watch state · roams · WiFi drops · poll stalls · heap
+              · roam policy
+Diagnostics   Last reset · boots, WiFi drops, poll stalls, roams since power-on
               Clock · event table (When | Event), newest first
 ```
 
@@ -214,11 +256,15 @@ software or watchdog reset but not a power cycle**. That is deliberate: an
 overnight self-reboot keeps its history, while pulling the plug gives a clean
 slate. "Since power-on" counters mean exactly what they say.
 
-Logged events: `boot`, `WiFi lost` (with the 802.11 reason code decoded),
-`WiFi recovered`, `self-reboot`, `RAIN — unsafe`, `dry — safe`,
-`polls stopped (link up)`, `polls resumed` (with the outage length). The rain
-events give a usable overnight rain history; the poll events give a forensic
-trail for client-side connection losses that the device otherwise can't see.
+Logged events (the last 24 are kept): `boot`, `WiFi lost` (with the 802.11
+reason code decoded), `WiFi connected` (BSSID, channel, RSSI), `connect failed`
+(BSSID and reason code, or timeout), `roamed` (from → to), `roam skipped` (with
+the reason), `self-reboot`, `RAIN — unsafe`, `dry — safe`, `polls stopped
+(link up)`, `polls resumed` (with the gap length), `client presumed gone`, and
+`client disconnected (Connected=false)`. An identical `roam skipped` entry is
+logged at most once an hour. The rain events give a usable overnight rain
+history; the poll events give a forensic trail for client-side connection
+losses that the device otherwise can't see.
 
 ---
 
@@ -241,7 +287,7 @@ confuse the client.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Live status, link health and diagnostics |
-| GET | `/status.json` | Live data for the page's JS (safe, GPIO, last poll age, stalls, RSSI, heap) |
+| GET | `/status.json` | Live data for the page's JS (safe, GPIO, last poll age, stalls, RSSI, BSSID, channel, roams, heap) |
 
 ### ASCOM Alpaca API (port 11111)
 
@@ -301,8 +347,9 @@ why the headline uses a GFXFF free font rather than a built-in one.
 | Display flickers | `createSprite()` failed and it fell back to direct drawing — check free heap on the status page |
 | Always shows NOT SAFE | `digitalRead(RAIN_PIN)` should be 1 when dry. Check the 4.7 kΩ pull-up to **3V3**, and that the sensor is on D27, not one of the input-only pins |
 | Device not found in discovery | Confirm device and PC are on the same subnet; check UDP port 32227. Discovery is re-armed automatically after a WiFi recovery |
-| WiFi not connecting | Verify `secrets.h` credentials; confirm 2.4 GHz network. The device reboots itself after 30 s of failed association |
+| WiFi not connecting | Verify `secrets.h` credentials; confirm 2.4 GHz network. The device reboots itself after 90 s of failed association |
 | Unexplained reboots | Check **Last reset** on the status page. `BROWNOUT (power dip)` means the 5 V supply is marginal — the WROOM-32 draws ~160 mA peak |
+| Joined a distant AP | Check the `WiFi connected` and `connect failed` events. A `connect failed` on the near AP followed by a connect elsewhere usually means UniFi **Lock to AP** is pinning the device to another AP |
 | Nightly single WiFi drop | Check the event log's reason code. Reason 15 is the AP's group-key rotation timing out — an AP-side setting, not a device fault |
 
 ---
