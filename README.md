@@ -365,7 +365,7 @@ Alpaca-RG11-ESP32-SafetyMonitor/
 │   ├── secrets.h            # WiFi credentials – git-ignored
 │   └── secrets.h.example    # Template – committed to Git
 ├── .gitignore               # Excludes .pio/, secrets.h
-├── rg11.jpg                 # Hydreon RG-11 sensor
+├── images/                  # Sensor photo, display screenshots, install photo
 └── README.md                # This file
 ```
 
